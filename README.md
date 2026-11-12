@@ -145,7 +145,7 @@ DERP_REGION_NAME=Singapore
 说明：
 
 - `DERP_HOSTNAME` 必须是第 3 步已经解析好的**完整域名**，不要带 `https://`。
-- `DERP_REGION_ID` 必须在 **900–999**（这是 Tailscale 留给用户的号段）。**每台 DERP 用不同的 ID**：第一台 900，第二台 901，以此类推（官方规定一个 Region 只能有一台 DERP）。
+- `DERP_REGION_ID` 必须在 **900–999**（这是 Tailscale 留给用户的号段）。**每台 DERP 用不同的 ID**：第一台 900，第二台 901，以此类推（官方规定一个 Region 只能有一台 DERP）。把新节点合并进已有的 `derpMap` 时，不要覆盖或删掉已经在用的 Region（例如原来的 900）。
 - `DERP_REGION_CODE` / `DERP_REGION_NAME` 是给你自己看的短名和全名，例如 `sg` / `Singapore`。
 - `ACME_EMAIL` 可留空。
 
@@ -193,15 +193,15 @@ cd ~/derp-bootstrap
 sudo bash install.sh
 ```
 
-脚本会先核对域名是否已经指向本机 IP（最多等大约 3 分钟）。若这里报错，回到阿里云检查 A 记录和安全组，修好后再运行同一条命令，可以重复执行。
+脚本会先核对域名是否已经指向本机 IP（最多等大约 3 分钟；会同时查询 `223.5.5.5` 和 `8.8.8.8`）。若这里报错，回到阿里云检查 A 记录和安全组，修好后再运行同一条命令，可以重复执行。国内机器安装 Go、编译 derper 时，脚本会优先用阿里云镜像和 `goproxy.cn`，一般不必手动换源。若遇到 Ubuntu 自动更新占用软件包锁，脚本会等待最多约 5 分钟。
 
 成功时，终端最后会打印一段 `derpMap` JSON，并提示证书已申请好。服务器上的 `derp.env` 里的 `TS_AUTHKEY` 会被清空，避免密钥留在 VPS 磁盘上；你电脑上的那份还在，请继续保管好。
 
 ## 4. 把节点写进 Tailscale 策略
 
-打开 [Access controls](https://login.tailscale.com/admin/acls)。**不要清空原文件**，只在最外层 JSON 里增加（或合并）脚本打印的 `derpMap`。若你已经有 `derpMap`，把新的 `"900": { ... }` 放进已有的 `Regions` 里即可。
+打开 [Access controls](https://login.tailscale.com/admin/acls)。**不要清空原文件**，只在最外层 JSON 里增加（或合并）脚本打印的 `derpMap`。若你已经有 `derpMap`，把新的 Region（例如 `"901": { ... }`）放进已有的 `Regions` 里，**不要覆盖**已经在用的 `"900"`。脚本打印的节点会带上探测到的 `IPv4`，没有公网 IPv6 时是 `"IPv6": "none"`，请一并保留——这样本机代理开了 fake-ip 时也不会把域名解析错。
 
-保存后，等一两分钟。再开一台机器时，换一个 RegionID，再合并进去。
+保存后，等一两分钟。再开一台机器时，换一个 RegionID（901、902……），再合并进去。
 
 ## 5. 验证
 
@@ -228,9 +228,12 @@ sudo journalctl -u derper -f
 | --- | --- |
 | 脚本提示域名解析不对 | 阿里云 A 记录的记录值、TTL 是否已生效；`dig +short 你的域名` |
 | 证书申请失败、https 打不开 | 安全组是否放行了 **TCP 80 和 443**；域名是否指错；是否开了 CDN |
-| `netcheck` 看不到自定义区域 | 策略里的 `derpMap` 是否已保存、JSON 逗号是否写对、RegionID 是否 900–999 |
-| 能看到区域但连不上 / 延迟异常 | 安全组是否放行了 **UDP 3478** 和 ICMP；不要走 CDN 或 SLB |
-| `tailscale up` 失败，提到 tag | ACL 里是否已有 `tagOwners` 的 `tag:derp`，密钥是否勾了同样的 tag，是否过期 |
+| `netcheck` 看不到自定义区域 | 策略里的 `derpMap` 是否已保存、JSON 逗号是否写对、RegionID 是否 900–999；第二台是否误覆盖了第一台的 Region |
+| 能看到区域但没有延迟 / 连不上 | `derpMap` 节点是否写了真实 `IPv4`，没有 IPv6 时是否为 `"IPv6": "none"`（本机代理的 fake-ip 会把域名解析成 `198.18.x.x`）；安全组是否放行了 **UDP 3478** 和 ICMP；不要走 CDN 或 SLB |
+| 本机 `curl` 域名失败，但服务器上是通的 | 本机代理 TUN / fake-ip 把域名解析错了，用 `--resolve 域名:443:真实IP` 验证，并在 `derpMap` 里写上 IPv4 |
+| `tailscale up` 失败，提到 tag | ACL 里是否已有 `tagOwners`（`tag:derp` 或你实际用的标签，例如 `tag:relay`），密钥是否勾了同样的 tag，是否在保存 ACL **之后**新建的；过期的或改 ACL 之前创建的 key 要换新 |
+| 提示无法获取 dpkg / apt 锁 | 系统 `unattended-upgrades` 正在更新，脚本会自动等；若超时，稍后再跑一次，不要手动删锁文件 |
+| 安装 Go 或编译 derper 很慢 / 失败 | 国内访问 `go.dev` 和 `proxy.golang.org` 常会超时，脚本已改走国内镜像；若仍失败，检查 VPS 的 DNS（阿里云 VPC DNS 加 `223.5.5.5`）和出网 |
 | 加入网络后 `--verify-clients` 拒绝连接 | DERP 这台设备在 ACL 里能否看到其他节点 |
 
 更新 derper（以后升级 Tailscale 时建议一并做）：把本项目重新上传（不必重新填已清空的服务器端密钥，只要机器仍在网内），再执行一次 `sudo bash install.sh`。脚本发现已经加入 Tailscale 就会跳过 auth key，并按当前 `tailscale` 版本重新编译 derper。

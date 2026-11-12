@@ -77,10 +77,35 @@ if [[ "$need_auth" -eq 1 ]]; then
   [[ "$TS_AUTHKEY" != tskey-auth-xxxxxxxx ]] || fail "TS_AUTHKEY 还是示例值，请填入真实密钥"
 fi
 
+wait_apt_lock() {
+  command -v apt-get >/dev/null 2>&1 || return 0
+  local i lock="/var/lib/dpkg/lock-frontend"
+  [[ -e "$lock" ]] || return 0
+  for i in $(seq 1 60); do
+    if command -v flock >/dev/null 2>&1; then
+      if flock --exclusive --nonblock "$lock" --command true 2>/dev/null; then
+        return 0
+      fi
+    elif command -v fuser >/dev/null 2>&1; then
+      if ! fuser "$lock" >/dev/null 2>&1; then
+        return 0
+      fi
+    else
+      return 0
+    fi
+    if [[ "$i" -eq 1 ]]; then
+      log "等待系统自动更新释放软件包锁（最多约 5 分钟）……"
+    fi
+    sleep 5
+  done
+  fail "软件包锁仍被占用（常见于 unattended-upgrades 正在运行）。请等几分钟后再执行：sudo bash install.sh"
+}
+
 install_pkgs() {
   log "安装系统依赖……"
   if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
+    wait_apt_lock
     apt-get update -y
     apt-get install -y curl ca-certificates dnsutils
   elif command -v dnf >/dev/null 2>&1; then
@@ -117,11 +142,18 @@ wait_dns() {
   local want="$1" host="$2" got="" i
   log "等待域名 ${host} 解析到 ${want} ……"
   for i in $(seq 1 36); do
-    got="$(dig +short A "$host" @8.8.8.8 2>/dev/null | grep -E '^[0-9.]+$' | tail -n1 || true)"
-    if [[ "$got" == "$want" ]]; then
-      log "DNS 已生效：${host} → ${got}"
-      return 0
-    fi
+    local dns
+    for dns in 223.5.5.5 223.6.6.6 8.8.8.8 ""; do
+      if [[ -n "$dns" ]]; then
+        got="$(dig +short +time=2 +tries=1 A "$host" "@$dns" 2>/dev/null | grep -E '^[0-9.]+$' | tail -n1 || true)"
+      else
+        got="$(dig +short +time=2 +tries=1 A "$host" 2>/dev/null | grep -E '^[0-9.]+$' | tail -n1 || true)"
+      fi
+      if [[ "$got" == "$want" ]]; then
+        log "DNS 已生效：${host} → ${got}"
+        return 0
+      fi
+    done
     sleep 5
   done
   fail "域名 ${host} 当前解析是「${got:-空}」，期望是 ${want}。请到阿里云「云解析 DNS」检查 A 记录是否已生效，然后再跑一次本脚本。"
@@ -141,6 +173,7 @@ maybe_ufw() {
 install_tailscale() {
   if ! command -v tailscale >/dev/null 2>&1; then
     log "安装 Tailscale……"
+    wait_apt_lock
     curl -fsSL https://tailscale.com/install.sh | sh
   else
     log "已安装 Tailscale，跳过。"
@@ -179,25 +212,77 @@ join_tailnet() {
   tailscale status >/dev/null || fail "加入 Tailscale 失败。请确认 auth key 有效，并且 ACL 里已设置 tagOwners（tag:derp）。"
 }
 
+go_version_from_url() {
+  local ver
+  ver="$(curl -4 -fsSL --connect-timeout 10 --max-time 20 "$1" | head -n1)" || true
+  if [[ "$ver" == go1.* ]]; then
+    printf '%s' "$ver"
+    return 0
+  fi
+  return 1
+}
+
+go_version_from_listing() {
+  local ver
+  ver="$(curl -4 -fsSL --connect-timeout 10 --max-time 20 "$1" | grep -oE 'go1\.[0-9]+\.[0-9]+\.linux-amd64\.tar\.gz' | sed 's/\.linux-amd64\.tar\.gz//' | sort -t. -k2,2n -k3,3n | tail -1)" || true
+  if [[ "$ver" == go1.* ]]; then
+    printf '%s' "$ver"
+    return 0
+  fi
+  return 1
+}
+
+download_go_tarball() {
+  local url="$1" dest="$2"
+  log "尝试下载：${url}"
+  rm -f "$dest"
+  if curl -4 -fL --connect-timeout 15 --retry 3 --retry-delay 2 --speed-limit 1000 --speed-time 30 -o "$dest" "$url"; then
+    if tar -tzf "$dest" >/dev/null 2>&1; then
+      return 0
+    fi
+    log "下载的文件不是有效的 Go 安装包，换源再试。"
+  else
+    log "下载失败或卡住，换源再试。"
+  fi
+  rm -f "$dest"
+  return 1
+}
+
 install_go() {
   if command -v go >/dev/null 2>&1; then
     log "已安装 Go：$(go version)"
     return 0
   fi
-  local ver arch tarball
-  ver="$(curl -fsSL --max-time 20 'https://go.dev/VERSION?m=text' | head -n1)" || true
-  [[ -n "$ver" ]] || fail "无法获取 Go 版本号，请检查 VPS 是否能访问 go.dev。"
+  local ver arch tarball dest url
   case "$(uname -m)" in
     x86_64)  arch="amd64" ;;
     aarch64|arm64) arch="arm64" ;;
     *) fail "不支持的 CPU 架构：$(uname -m)" ;;
   esac
+
+  ver="$(go_version_from_url 'https://golang.google.cn/VERSION?m=text' || true)"
+  [[ -n "$ver" ]] || ver="$(go_version_from_url 'https://go.dev/VERSION?m=text' || true)"
+  [[ -n "$ver" ]] || ver="$(go_version_from_listing 'https://mirrors.cloud.aliyuncs.com/golang/' || true)"
+  [[ -n "$ver" ]] || ver="$(go_version_from_listing 'https://mirrors.aliyun.com/golang/' || true)"
+  [[ -n "$ver" ]] || fail "无法获取 Go 版本号。请检查 VPS 出网和 DNS（建议 阿里云 VPC DNS 加 223.5.5.5）。"
+
   tarball="${ver}.linux-${arch}.tar.gz"
+  dest="/tmp/${tarball}"
   log "安装 ${ver}（${arch}）……"
-  curl -fL --retry 3 -o "/tmp/${tarball}" "https://go.dev/dl/${tarball}"
+  url=""
+  for url in \
+      "https://mirrors.cloud.aliyuncs.com/golang/${tarball}" \
+      "https://mirrors.aliyun.com/golang/${tarball}" \
+      "https://golang.google.cn/dl/${tarball}" \
+      "https://go.dev/dl/${tarball}"; do
+    download_go_tarball "$url" "$dest" && break
+    url=""
+  done
+  [[ -n "$url" && -f "$dest" ]] || fail "从国内镜像和 go.dev 下载 Go 都失败了。请检查出网后重试。"
+
   rm -rf /usr/local/go
-  tar -C /usr/local -xzf "/tmp/${tarball}"
-  rm -f "/tmp/${tarball}"
+  tar -C /usr/local -xzf "$dest"
+  rm -f "$dest"
   ln -sfn /usr/local/go/bin/go /usr/local/bin/go
   log "$(go version)"
 }
@@ -211,9 +296,12 @@ install_derper() {
   log "编译 derper（对齐 Tailscale ${ts_ver}）……"
   umask 022
   export GOBIN="/usr/local/bin"
+  export GOPROXY="${GOPROXY:-https://goproxy.cn,direct}"
+  export GOSUMDB="${GOSUMDB:-sum.golang.google.cn}"
+  log "使用 GOPROXY=${GOPROXY}"
   if ! go install "tailscale.com/cmd/derper@${tag}"; then
     log "按精确版本编译失败，改用 @latest 再试一次……"
-    go install tailscale.com/cmd/derper@latest || fail "编译 derper 失败。请确认 VPS 能访问 proxy.golang.org 或 GitHub。"
+    go install tailscale.com/cmd/derper@latest || fail "编译 derper 失败。请检查出网，或手动设置 GOPROXY（国内可用 https://goproxy.cn,direct）。"
   fi
   [[ -x "$DERPER_BIN" ]] || fail "未找到 ${DERPER_BIN}"
   log "derper 已安装：$("$DERPER_BIN" --version 2>/dev/null || echo "$DERPER_BIN")"
@@ -278,17 +366,15 @@ wait_healthy() {
 }
 
 print_derpmap() {
-  local ipv4="$1" ipv6="$2"
-  local ipv6_line=""
-  if [[ -n "$ipv6" ]]; then
-    ipv6_line=$(printf '            "IPv6": "%s",\n' "$ipv6")
-  fi
+  local ipv4="$1" ipv6="${2:-none}"
+  [[ -n "$ipv6" ]] || ipv6="none"
   cat <<EOF
 
 ======== 部署完成 ========
 
 请把下面这段合并到 Tailscale 策略文件（Access controls）的最外层，
 保留原有内容，只增加或合并 derpMap。不要删掉其他规则。
+若已经有 derpMap，把这个 Region 合并进已有的 Regions，不要覆盖其他 RegionID。
 
 打开：https://login.tailscale.com/admin/acls
 
@@ -304,7 +390,8 @@ print_derpmap() {
           "RegionID": ${DERP_REGION_ID},
           "HostName": "${DERP_HOSTNAME}",
           "IPv4": "${ipv4}",
-${ipv6_line}            "STUNPort": 3478,
+          "IPv6": "${ipv6}",
+          "STUNPort": 3478,
           "DERPPort": 443
         }
       ]
@@ -312,7 +399,9 @@ ${ipv6_line}            "STUNPort": 3478,
   }
 }
 
-注意：每个 RegionID 只能有一台 DERP。再开一台 VPS 时，请换 901、902……
+注意：必须写上 IPv4；没有公网 IPv6 时请保持 "IPv6": "none"。
+这样客户端（尤其是本机代理开了 fake-ip 的电脑）不会把域名解析错。
+每个 RegionID 只能有一台 DERP。再开一台 VPS 时，请换 901、902……
 
 保存策略后，在任意已登录的设备上检查：
 
