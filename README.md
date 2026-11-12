@@ -1,101 +1,96 @@
 # derp-bootstrap
 
-在一台新的 VPS 上，把私人 Tailscale DERP 中转站一次性装好。本指南默认你是新手，按「准备工作」和「一键部署」两步走。示例环境是**阿里云 ECS** + **阿里云云解析 DNS**，系统建议 Ubuntu 22.04 / 24.04，Alibaba Cloud Linux 也可以。
+一键在 Linux VPS 上部署与维护私人 [Tailscale DERP](https://tailscale.com/docs/reference/derp-servers/custom-derp-servers) 中转节点的自动化脚本。
 
-DERP 是 Tailscale 的中转：两台设备没法打洞直连时，流量会经它转发（内容仍然是加密的）。你已经有一套在用的话，这个项目就是为了下次开新机器时少踩坑。
-
----
-
-## 你会得到什么
-
-准备阶段在网页里完成（密钥、固定 IP、域名、填配置表）。部署阶段从你自己的电脑 SSH 上去，上传两个文件，跑一条命令。脚本会：
-
-- 检查域名已经解析到这台机器
-- 安装 Tailscale 并用密钥加入你的网络（开启 `--verify-clients`，只允许你自己的设备使用）
-- 安装与本机 Tailscale 版本对齐的 `derper`，申请 Let's Encrypt 证书，并用 systemd 保持运行
-- 打印一段要粘贴到 Tailscale 策略里的 `derpMap` JSON
-
-需要开放的端口（[官方要求](https://tailscale.com/docs/reference/derp-servers/custom-derp-servers)）：
-
-| 协议 | 端口 | 用途 |
-| --- | --- | --- |
-| TCP | 80 | Let's Encrypt 申请证书（不能改端口） |
-| TCP | 443 | DERP 中转 |
-| UDP | 3478 | STUN |
-| ICMP | — | 连通性探测，入站和出站都要放行 |
-
-不要把 DERP 放在 CDN、SLB 或会改写源地址的负载均衡后面，也不要开橙色云朵之类的代理。
+当两台 Tailscale 设备因复杂 NAT 无法打洞直连（P2P）时，流量会通过 DERP 服务器进行端到端加密中转。官方公共中转节点在跨网或高峰期往往延迟较高，自建私人 DERP 可以显著降低中转延迟并提升连接稳定性。
 
 ---
 
-# 第一部分：准备工作
+## 核心特性
 
-下面这些都在你自己的电脑和网页控制台完成，**还不用 SSH 到 VPS 装软件**。全部准备好后，再做第二部分。
+- **防白嫖鉴权（`--verify-clients`）**：自动安装并关联本机 `tailscaled`，仅允许你自己 Tailnet 内的设备使用中转服务。
+- **版本严格对齐**：自动检测本机安装的 Tailscale 版本并从源码编译同版本 `derper`，避免协议版本不匹配。
+- **全自动 HTTPS 证书**：集成 Let's Encrypt 自动签发与续期 TLS 证书，并通过 systemd 守护进程开机自启。
+- **国内外网络自适应**：自动检测网络环境，智能切换官方源与国内镜像（阿里云 Go 镜像、`goproxy.cn`），原生支持 `amd64` 与 `arm64` 架构。
+- **防代理 Fake-IP 劫持**：自动探测服务器公网 IPv4 / IPv6 并生成含显式 IP 的 `derpMap` JSON，避免客户端开启代理（Clash / Surge 等 Fake-IP 模式）时解析错误导致断连。
+- **凭证阅后即焚**：首次入网成功后自动擦除服务器配置文件中的 `TS_AUTHKEY`，降低密钥泄露风险。
+- **全生命周期管理**：内置 `--status`（状态与配置查看）、`--update`（一键升级对齐）、`--uninstall`（干净卸载）子命令。
 
-## 1. 固定 VPS 的公网 IP
+---
 
-DERP 和域名都要指向一个不会随便变的公网 IP。推荐使用阿里云**弹性公网 IP（EIP）**。
+## 目录
 
-1. 打开 [ECS 控制台](https://ecs.console.aliyun.com)，进入这台实例，记下「公网 IP」。
-2. 判断它是不是 EIP：
-   - 已经是弹性公网 IP：直接把这个地址记到记事本，进入下一步。
-   - 显示为「固定公网 IP」：在实例的公网 IP 处选择**转换为弹性公网 IP**。转换后地址通常不变，但请当场确认。已有固定公网 IP 的实例，不能再另外绑一个 EIP，需要先转换。[官方说明](https://help.aliyun.com/zh/eip/product-overview/getting-started)
-   - 还没有公网 IP：打开 [弹性公网 IP 控制台](https://vpc.console.aliyun.com/eip)，**地域必须和 ECS 相同**，创建后在操作列选择「绑定资源」→ 云服务器 ECS，选中这台实例。
+- [环境与前置要求](#环境与前置要求)
+- [第一部分：准备工作](#第一部分准备工作)
+  - [1. 准备固定公网 IP 与放行端口](#1-准备固定公网-ip-与放行端口)
+  - [2. 配置域名 DNS 解析](#2-配置域名-dns-解析)
+  - [3. 准备 Tailscale 标签与 Auth Key](#3-准备-tailscale-标签与-auth-key)
+- [第二部分：开始部署](#第二部分开始部署)
+  - [方式 A：本地填好配置，一键上传部署（推荐多节点管理）](#方式-a本地填好配置一键上传部署推荐多节点管理)
+  - [方式 B：直接在 VPS 上克隆部署](#方式-b直接在-vps-上克隆部署)
+- [第三部分：接入 Tailscale 网络与验证](#第三部分接入-tailscale-网络与验证)
+  - [1. 将 derpMap 写入 Tailscale ACL](#1-将-derpmap-写入-tailscale-acl)
+  - [2. 验证节点连通性](#2-验证节点连通性)
+- [配置项参考（derp.env）](#配置项参考derpenv)
+- [日常维护（升级、状态、扩容、卸载）](#日常维护升级状态扩容卸载)
+- [常见问题排查（FAQ）](#常见问题排查faq)
 
-以后不要轻易释放这台 EIP，否则域名和 DERP 都要跟着改。
+---
 
-带宽方面，DERP 不吃 CPU，主要吃流量和带宽。按你预计的中转用量选即可，例如 3–5 Mbps 起步，不够再升。
+## 环境与前置要求
 
-## 2. 在安全组放行端口
+1. **操作系统**：支持主流 Linux 发行版（推荐 **Ubuntu 22.04 / 24.04**、**Debian 11 / 12**，也支持 **Alibaba Cloud Linux 3**、**CentOS Stream / Rocky / AlmaLinux 8+**）。
+2. **公网 IP**：VPS 需具备独立的**固定公网 IPv4**（如云厂商的弹性公网 IP）。
+3. **域名**：一个可添加 `A` 记录的子域名（如 `derp-sg.example.com`）。
+   - **切勿开启 CDN 或反向代理**（如 Cloudflare 橙色云朵、阿里云全站加速、负载均衡 SLB），DERP 必须直连服务器真实 IP。
+   - **关于备案**：若 VPS 位于**中国内地**地域，使用 `80` / `443` 端口对外提供 HTTPS 服务通常需完成 ICP 备案；中国香港、新加坡、东京、美西等境外地域无需备案。
+4. **开放端口**：需在云厂商「安全组 / 防火墙」中放行以下入站规则（授权对象 `0.0.0.0/0`）：
 
-1. 仍在 ECS 控制台，点进这台实例 → **安全组** → **配置规则** → **入方向** → **增加规则**。
-2. 增加下面四条（授权对象填 `0.0.0.0/0`，因为你的设备可能从家里、校园网或手机网络连进来）：
+| 协议 | 端口 | 用途 | 备注 |
+| :--- | :--- | :--- | :--- |
+| **TCP** | `80` | Let's Encrypt 证书申请与续期 | HTTP-01 验证使用，不可关闭 |
+| **TCP** | `443` | DERP HTTPS 中转服务 | 可在 `derp.env` 中自定义 `DERP_PORT` |
+| **UDP** | `3478` | STUN 打洞辅助服务 | **注意协议是 UDP**，不要误建为 TCP |
+| **ICMP** | 全部 | 延迟探测与连通性检查 | 入站与出站均需放行 |
 
-| 协议类型 | 端口范围 | 授权对象 | 用途 |
-| --- | --- | --- | --- |
-| TCP | 80 | 0.0.0.0/0 | 申请证书 |
-| TCP | 443 | 0.0.0.0/0 | DERP |
-| UDP | 3478 | 0.0.0.0/0 | STUN（不要误建成 TCP） |
-| 全部 ICMP | — | 0.0.0.0/0 | 官方要求放行 ICMP |
+---
 
-3. 不要删掉已有的 SSH（TCP 22）规则，否则你会连不上去。22 端口最好只允许你自己的 IP，不要为了省事改成对全世界开放（如果现在已经是 `0.0.0.0/0`，有空再收紧）。
-4. 如果你另外开了阿里云「云防火墙」，那里也要放行同样的端口。
+## 第一部分：准备工作
 
-出方向一般默认全放，不用改。
+以下步骤在云服务商网页控制台与 Tailscale 后台完成。
 
-## 3. 把域名解析到这个 IP
+### 1. 准备固定公网 IP 与放行端口
 
-使用已在阿里云管理的域名，给这台 DERP 一个**专用子域名**，例如 `derp-sg.yourdomain.com`。
+1. 在你的云服务商控制台（阿里云、腾讯云、AWS、Vultr 等）记下 VPS 的**公网 IPv4 地址**。
+   > **提示（以阿里云 ECS 为例）**：如果实例显示为「固定公网 IP」，建议在控制台将其「转换为弹性公网 IP（EIP）」，避免将来实例规格变更时 IP 变化。
+2. 进入实例所属的**安全组 / 防火墙**，按上方表格添加入方向规则（放行 `TCP 80`、`TCP 443`、`UDP 3478` 及 `ICMP`）。
+   - 请保留原有的 `SSH (TCP 22)` 规则，以免无法远程连接。
 
-1. 打开 [云解析 DNS 控制台](https://dns.console.aliyun.com) → **公网权威解析** → 找到你的域名 → **解析设置** → **添加记录**。
-2. 按下面填写（[官方添加 A 记录说明](https://help.aliyun.com/zh/dns/pubz-add-website-parsing)）：
+### 2. 配置域名 DNS 解析
 
-| 参数 | 填什么 |
-| --- | --- |
-| 记录类型 | A |
-| 主机记录 | 例如 `derp-sg`（不要填完整域名） |
-| 记录值 | 第 1 步记下的公网 IPv4 |
-| 解析请求来源 | 默认 |
-| TTL | 10 分钟即可，刚开始也可以更短，方便改错 |
+前往你的域名 DNS 服务商（如 Cloudflare、阿里云云解析 DNS、DNSPod 等），添加一条 `A` 记录：
 
-3. **不要**给这条记录开通 CDN 加速，也**不要**用 CNAME 指到 CDN 或负载均衡。
-4. 在你自己的电脑上验证（把域名换成你的）：
+| 参数 | 填写内容 |
+| :--- | :--- |
+| **记录类型** | `A` |
+| **主机记录（名称）** | 子域名前缀，例如 `derp-sg`（对应完整域名 `derp-sg.example.com`） |
+| **记录值（内容）** | 第 1 步记下的 VPS 公网 IPv4 |
+| **代理状态 / CDN** | **仅 DNS（关闭代理 / 灰色云朵）** |
+| **TTL** | `600`（10 分钟）或自动 |
+
+配置完成后，可在终端验证解析是否已生效：
 
 ```bash
-dig +short derp-sg.yourdomain.com
+dig +short derp-sg.example.com
 ```
 
-返回的 IP 必须和第 1 步完全一致。如果是空的或还是旧地址，再等几分钟。
+### 3. 准备 Tailscale 标签与 Auth Key
 
-如果这台 ECS 在**中国内地**，用 80/443 对外提供 HTTPS 通常需要完成 ICP 备案。机器在新加坡、东京等海外地域则一般不需要。
+为了让 VPS 免交互自动加入你的 Tailscale 网络，并具备持久化标签身份，建议按以下两步生成 `TS_AUTHKEY`：
 
-## 4. 准备 Tailscale 标签和 auth key
+#### 3.1 在 ACL 中声明标签（`tagOwners`）
 
-密钥是让 VPS **免登录网页、自动加入**你的 Tailscale 网络用的。带标签的密钥，必须先在 ACL 里声明谁能拥有这个标签，再建密钥。
-
-### 4.1 先改访问控制（ACL）
-
-打开 [Access controls](https://login.tailscale.com/admin/acls)。在策略 JSON **最外层**加上（如果已经有 `tagOwners`，就在里面加一行，不要把原内容删掉）：
+打开 [Tailscale Access Controls](https://login.tailscale.com/admin/acls)，在策略 JSON 的**最外层**添加 `tagOwners`（若已有 `tagOwners` 字段，只需在其中新增 `"tag:derp"` 一行，**切勿清空原有规则**）：
 
 ```json
 "tagOwners": {
@@ -103,148 +98,203 @@ dig +short derp-sg.yourdomain.com
 }
 ```
 
-如果你的 ACL 还是默认的「所有设备互相放通」（`src` 为 `*`、`dst` 为 `*:*`），到这里就可以保存了。
+保存策略文件。
 
-如果平时 ACL 比较严，还要保证：挂了 `--verify-clients` 的这台 DERP 机器，在 Tailscale 里能「看到」其他设备，否则别人连你的中转会被拒绝。不确定的话，可以先维持较宽松的规则，或参考 [自定义 DERP 说明](https://tailscale.com/docs/reference/derp-servers/custom-derp-servers)。
+> **注意**：如果你的 ACL 修改过默认的全局放通规则，请确保挂载了 `tag:derp` 的节点与网络内其他设备在 ACL 中互相可见，否则 `--verify-clients` 会拒绝未授权设备的连接。
 
-### 4.2 再生成密钥
+#### 3.2 生成 Auth Key
 
-打开 [Keys](https://login.tailscale.com/admin/settings/keys) → **Generate auth key**，按下面选：
+打开 [Tailscale Keys 页面](https://login.tailscale.com/admin/settings/keys) → 点击 **Generate auth key**，按以下推荐配置勾选：
 
-| 选项 | 怎么选 | 原因 |
-| --- | --- | --- |
-| Reusable（可重复使用） | 勾选 | 以后多台 VPS 可以共用同一把（务必保管好） |
-| Ephemeral（临时设备） | **不要勾** | 勾了以后机器离线或重启可能被从网络里清掉 |
-| Pre-approved | 若你开了「设备审批」，请勾选 | 否则新机器要手动批准才能上线 |
-| Tags | 勾选，填 `tag:derp` | 和上面的 tagOwners 对应 |
-| 过期时间 | 按你的习惯设，例如 90 天 | 过期后要再生成一把，并更新 derp.env |
+| 选项 | 推荐设置 | 说明 |
+| :--- | :--- | :--- |
+| **Reusable（可复用）** | 勾选 | 方便后续重装或部署多台 DERP 节点复用 |
+| **Ephemeral（临时节点）** | **不勾选** | 避免服务器短暂重启或离线后被自动移除 |
+| **Pre-approved（预批准）** | 勾选（若启用了设备审批） | 新节点无需人工点击批准即可上线 |
+| **Tags（标签）** | 勾选并选择 `tag:derp` | 绑定刚才声明的标签（自动禁用客户端密钥过期） |
 
-生成后**立刻复制**，密钥只显示一次，格式类似 `tskey-auth-...`。把它先贴到一个仅你可见的地方（下一步会写入 `derp.env`）。不要发到聊天或截图给别人。
-
-## 5. 填写配置表
-
-在你自己的电脑上打开本项目目录：
-
-```bash
-cp derp.env.example derp.env
-chmod 600 derp.env
-```
-
-用任意编辑器打开 `derp.env`，至少改这几项：
-
-```bash
-DERP_HOSTNAME=derp-sg.yourdomain.com
-TS_AUTHKEY=tskey-auth-把你复制的密钥贴这里
-TS_HOSTNAME=derp-sg
-TS_ADVERTISE_TAGS=tag:derp
-DERP_REGION_ID=900
-DERP_REGION_CODE=sg
-DERP_REGION_NAME=Singapore
-```
-
-说明：
-
-- `DERP_HOSTNAME` 必须是第 3 步已经解析好的**完整域名**，不要带 `https://`。
-- `DERP_REGION_ID` 必须在 **900–999**（这是 Tailscale 留给用户的号段）。**每台 DERP 用不同的 ID**：第一台 900，第二台 901，以此类推（官方规定一个 Region 只能有一台 DERP）。把新节点合并进已有的 `derpMap` 时，不要覆盖或删掉已经在用的 Region（例如原来的 900）。
-- `DERP_REGION_CODE` / `DERP_REGION_NAME` 是给你自己看的短名和全名，例如 `sg` / `Singapore`。
-- `ACME_EMAIL` 可留空。
-
-到这里，准备工作结束。下面可以开始一键部署。
+点击生成后，**立即复制**形如 `tskey-auth-...` 的密钥字符串妥善保存。
 
 ---
 
-# 第二部分：一键部署
+## 第二部分：开始部署
 
-在你**自己的电脑**上操作上传，再 SSH 到服务器执行安装。下面假设 VPS 用户是 `root`，公网 IP 是 `47.100.1.2`，请换成你的。如果阿里云给的是 `ecs-user`，把命令里的 `root` 改成 `ecs-user`。
+你可以任选以下两种方式之一完成部署。
 
-## 1. SSH 先确认能登录
+### 方式 A：本地填好配置，一键上传部署（推荐多节点管理）
+
+适合在个人电脑（macOS / Linux / WSL）上集中管理配置文件，并通过 SSH 推送到远程服务器。
+
+1. **克隆项目并创建配置文件**：
+
+   ```bash
+   git clone https://github.com/AmazingUmi/derp-bootstrap.git
+   cd derp-bootstrap
+   cp derp.env.example derp.env
+   chmod 600 derp.env
+   ```
+
+2. **编辑 `derp.env`**：填入你的域名与密钥（完整参数见下方[配置项参考](#配置项参考derpenv)）：
+
+   ```ini
+   DERP_HOSTNAME=derp-sg.example.com
+   TS_AUTHKEY=tskey-auth-你的真实密钥
+   TS_HOSTNAME=derp-sg
+   TS_ADVERTISE_TAGS=tag:derp
+   DERP_REGION_ID=900
+   DERP_REGION_CODE=sg
+   DERP_REGION_NAME=Singapore
+   ```
+
+3. **上传并执行安装**：
+
+   ```bash
+   # 上传并直接在远程服务器上启动安装（请将 root@47.100.1.2 替换为你的服务器用户名和 IP）
+   ./upload.sh --run root@47.100.1.2
+   ```
+
+   > **提示**：
+   > - 如果你的 SSH 使用了非默认端口或指定私钥，可传入 `-p <端口>` 和 `-i <私钥路径>`，例如：`./upload.sh -p 2222 -i ~/.ssh/id_ed25519 --run root@47.100.1.2`。
+   > - 如果只想先上传文件、再手动登录服务器执行，去掉 `--run` 即可。
+
+### 方式 B：直接在 VPS 上克隆部署
+
+适合已经通过 SSH 登录到目标 VPS 的用户。
 
 ```bash
-ssh root@47.100.1.2
-```
+git clone https://github.com/AmazingUmi/derp-bootstrap.git
+cd derp-bootstrap
+cp derp.env.example derp.env
+chmod 600 derp.env
 
-能进去并看到命令提示符即可，先输入 `exit` 退回自己的电脑——上传要在本地做。
+# 使用 nano 或 vim 编辑配置，填入 DERP_HOSTNAME 和 TS_AUTHKEY
+nano derp.env
 
-如果你用密钥文件登录，平时怎么连，后面 `upload.sh` 也会沿用同样的 SSH 配置（例如 `~/.ssh/config`）。
-
-## 2. 上传脚本和配置表
-
-仍在**自己电脑**的 `derp-bootstrap` 目录里：
-
-```bash
-chmod +x upload.sh install.sh
-./upload.sh root@47.100.1.2
-```
-
-它会把 `install.sh` 和 `derp.env` 传到服务器的 `~/derp-bootstrap/`，并设好权限。如果提示还是示例内容，说明 `derp.env` 没改完，先回到第一部分第 5 步。
-
-等价的手动命令是：
-
-```bash
-ssh root@47.100.1.2 "mkdir -p ~/derp-bootstrap && chmod 700 ~/derp-bootstrap"
-scp install.sh derp.env root@47.100.1.2:~/derp-bootstrap/
-```
-
-## 3. 一键安装
-
-```bash
-ssh root@47.100.1.2
-cd ~/derp-bootstrap
+# 运行一键安装脚本
 sudo bash install.sh
 ```
 
-脚本会先核对域名是否已经指向本机 IP（最多等大约 3 分钟；会同时查询 `223.5.5.5` 和 `8.8.8.8`）。若这里报错，回到阿里云检查 A 记录和安全组，修好后再运行同一条命令，可以重复执行。国内机器安装 Go、编译 derper 时，脚本会优先用阿里云镜像和 `goproxy.cn`，一般不必手动换源。若遇到 Ubuntu 自动更新占用软件包锁，脚本会等待最多约 5 分钟。
+---
 
-成功时，终端最后会打印一段 `derpMap` JSON，并提示证书已申请好。服务器上的 `derp.env` 里的 `TS_AUTHKEY` 会被清空，避免密钥留在 VPS 磁盘上；你电脑上的那份还在，请继续保管好。
+## 第三部分：接入 Tailscale 网络与验证
 
-## 4. 把节点写进 Tailscale 策略
+### 1. 将 `derpMap` 写入 Tailscale ACL
 
-打开 [Access controls](https://login.tailscale.com/admin/acls)。**不要清空原文件**，只在最外层 JSON 里增加（或合并）脚本打印的 `derpMap`。若你已经有 `derpMap`，把新的 Region（例如 `"901": { ... }`）放进已有的 `Regions` 里，**不要覆盖**已经在用的 `"900"`。脚本打印的节点会带上探测到的 `IPv4`，没有公网 IPv6 时是 `"IPv6": "none"`，请一并保留——这样本机代理开了 fake-ip 时也不会把域名解析错。
+当 `install.sh` 运行成功时，终端末尾会自动输出一段包含本机公网 IPv4 / IPv6 的 `derpMap` JSON 配置：
 
-保存后，等一两分钟。再开一台机器时，换一个 RegionID（901、902……），再合并进去。
+```json
+"derpMap": {
+  "Regions": {
+    "900": {
+      "RegionID": 900,
+      "RegionCode": "sg",
+      "RegionName": "Singapore",
+      "Nodes": [
+        {
+          "Name": "900a",
+          "RegionID": 900,
+          "HostName": "derp-sg.example.com",
+          "IPv4": "47.100.1.2",
+          "IPv6": "none",
+          "STUNPort": 3478,
+          "DERPPort": 443
+        }
+      ]
+    }
+  }
+}
+```
 
-## 5. 验证
+打开 [Tailscale Access Controls](https://login.tailscale.com/admin/acls)，将这段 `"derpMap"` 合并到策略 JSON 的**最外层**并保存。
 
-在任意一台已经登录 Tailscale 的设备上（你的 Mac 即可）：
+- **切勿删掉原有的 ACL 规则**。
+- 如果你之前已经配置过 `"derpMap"`，只需将新的区域（如 `"901": { ... }`）合并进现有的 `"Regions"` 对象中，**不要覆盖**已有的 `"900"`。
+
+### 2. 验证节点连通性
+
+等待约 1 分钟策略下发后，在任意已登录 Tailscale 的设备上运行：
 
 ```bash
 tailscale netcheck
 ```
 
-输出里应出现你在配置表里写的区域名（例如 Singapore），并且有一个合理的延迟。也可以看：
-
-```bash
-sudo systemctl status derper
-sudo journalctl -u derper -f
-```
-
-浏览器打开 `https://你的域名/`，应能打开 derper 的默认页面（证书是有效的 Let's Encrypt）。
+若输出列表里出现了你配置的区域名（如 `Singapore`）并显示正常延迟（如 `35ms`），同时访问 `https://你的域名/` 能看到 DERP 默认页面且证书有效，即表示私人 DERP 中转已正式生效！
 
 ---
 
-## 出了问题怎么查
+## 配置项参考（`derp.env`）
 
-| 现象 | 先检查什么 |
-| --- | --- |
-| 脚本提示域名解析不对 | 阿里云 A 记录的记录值、TTL 是否已生效；`dig +short 你的域名` |
-| 证书申请失败、https 打不开 | 安全组是否放行了 **TCP 80 和 443**；域名是否指错；是否开了 CDN |
-| `netcheck` 看不到自定义区域 | 策略里的 `derpMap` 是否已保存、JSON 逗号是否写对、RegionID 是否 900–999；第二台是否误覆盖了第一台的 Region |
-| 能看到区域但没有延迟 / 连不上 | `derpMap` 节点是否写了真实 `IPv4`，没有 IPv6 时是否为 `"IPv6": "none"`（本机代理的 fake-ip 会把域名解析成 `198.18.x.x`）；安全组是否放行了 **UDP 3478** 和 ICMP；不要走 CDN 或 SLB |
-| 本机 `curl` 域名失败，但服务器上是通的 | 本机代理 TUN / fake-ip 把域名解析错了，用 `--resolve 域名:443:真实IP` 验证，并在 `derpMap` 里写上 IPv4 |
-| `tailscale up` 失败，提到 tag | ACL 里是否已有 `tagOwners`（`tag:derp` 或你实际用的标签，例如 `tag:relay`），密钥是否勾了同样的 tag，是否在保存 ACL **之后**新建的；过期的或改 ACL 之前创建的 key 要换新 |
-| 提示无法获取 dpkg / apt 锁 | 系统 `unattended-upgrades` 正在更新，脚本会自动等；若超时，稍后再跑一次，不要手动删锁文件 |
-| 安装 Go 或编译 derper 很慢 / 失败 | 国内访问 `go.dev` 和 `proxy.golang.org` 常会超时，脚本已改走国内镜像；若仍失败，检查 VPS 的 DNS（阿里云 VPC DNS 加 `223.5.5.5`）和出网 |
-| 加入网络后 `--verify-clients` 拒绝连接 | DERP 这台设备在 ACL 里能否看到其他节点 |
-
-更新 derper（以后升级 Tailscale 时建议一并做）：把本项目重新上传（不必重新填已清空的服务器端密钥，只要机器仍在网内），再执行一次 `sudo bash install.sh`。脚本发现已经加入 Tailscale 就会跳过 auth key，并按当前 `tailscale` 版本重新编译 derper。
+| 变量名 | 是否必填 | 默认值 | 说明 |
+| :--- | :---: | :---: | :--- |
+| `DERP_HOSTNAME` | **是** | — | 已解析到本机公网 IP 的完整域名（不含 `https://`） |
+| `TS_AUTHKEY` | 首次必填 | — | Tailscale 授权密钥（`tskey-auth-...`）；若机器已登录 Tailscale 可留空 |
+| `TS_HOSTNAME` | 否 | 域名前缀 | 在 Tailscale 设备列表中显示的机器名（如 `derp-sg`） |
+| `TS_ADVERTISE_TAGS` | 否 | `tag:derp` | 节点宣告的 ACL 标签；若生成的密钥未绑定标签，请设为空 |
+| `DERP_REGION_ID` | 否 | `900` | 自定义区域 ID（必须在 `900–999` 之间，每台 DERP 需唯一） |
+| `DERP_REGION_CODE` | 否 | `myderp` | 区域简写代号（如 `sg`、`hk`、`tyo`） |
+| `DERP_REGION_NAME` | 否 | `My DERP` | 区域全称（如 `Singapore`、`Hong Kong`） |
+| `ACME_EMAIL` | 否 | 空 | Let's Encrypt 证书通知邮箱 |
+| `DERP_PORT` | 否 | `443` | DERP HTTPS 监听端口 |
+| `DERP_HTTP_PORT` | 否 | `80` | Let's Encrypt HTTP-01 验证端口 |
+| `DERP_STUN_PORT` | 否 | `3478` | STUN UDP 监听端口 |
+| `DERP_VERIFY_CLIENTS` | 否 | `true` | 是否开启客户端身份校验（防止他人白嫖） |
+| `PUBLIC_IPV4` | 否 | 自动探测 | 手动指定本机公网 IPv4（仅在自动探测不准确时填写） |
 
 ---
 
-## 文件说明
+## 日常维护（升级、状态、扩容、卸载）
 
-| 文件 | 在哪用 | 作用 |
-| --- | --- | --- |
-| `derp.env.example` | 自己电脑 | 配置表模板 |
-| `derp.env` | 先在自己电脑填写，再上传 | 域名、密钥等；已加入 `.gitignore` |
-| `upload.sh` | 自己电脑 | 把脚本和配置传到 VPS |
-| `install.sh` | VPS 上 `sudo bash` | 一键安装并打印 derpMap |
+在 VPS 的 `derp-bootstrap` 目录下，可使用以下命令进行日常运维：
+
+- **查看运行状态与重新打印 `derpMap`**：
+  ```bash
+  sudo bash install.sh --status
+  ```
+- **升级 Tailscale 并重新编译对齐版本的 `derper`**：
+  ```bash
+  sudo bash install.sh --update
+  ```
+  > 无需重新填写已擦除的 `TS_AUTHKEY`，脚本会自动复用当前已登录的 Tailscale 状态。
+- **查看 `derper` 实时日志**：
+  ```bash
+  sudo journalctl -u derper -f
+  ```
+- **部署第 2、第 3 台 DERP 节点（多地域扩容）**：
+  修改 `derp.env` 中的 `DERP_HOSTNAME`、`TS_HOSTNAME`，并将 `DERP_REGION_ID` 改为 `901`（下一台 `902`），然后在新服务器上执行部署，最后将新区域合并进 Tailscale ACL 的 `derpMap.Regions` 中。
+- **卸载 `derper` 服务**：
+  ```bash
+  sudo bash install.sh --uninstall
+  ```
+
+---
+
+## 常见问题排查（FAQ）
+
+| 现象 / 报错 | 排查方法与解决方案 |
+| :--- | :--- |
+| **提示域名解析与本机公网 IP 不一致** | 1. 检查 DNS 服务商处的 `A` 记录是否填写正确；<br>2. 确保未开启 Cloudflare 橙色云朵或任何 CDN；<br>3. 在本地运行 `dig +short 你的域名` 确认 DNS 已刷新。 |
+| **证书签发失败 / HTTPS 无法访问** | 1. 检查云厂商**安全组**及系统防火墙是否已放行 **TCP 80** 与 **TCP 443**；<br>2. 若为中国内地云主机，检查域名是否已完成 ICP 备案；<br>3. 运行 `sudo journalctl -u derper -n 50` 查看具体 ACME 报错。 |
+| **提示端口 80 或 443 被占用** | 本机已运行了 Nginx / Apache / Caddy 等 Web 服务。请停止占用端口的服务，或在 `derp.env` 中修改 `DERP_PORT`（注意 Let's Encrypt HTTP-01 验证仍需占用 80 端口）。 |
+| **`tailscale up` 失败并提及 tag 权限** | 1. 检查 Tailscale ACL 中是否已保存 `"tagOwners": {"tag:derp": ["autogroup:admin"]}`；<br>2. Auth Key 必须在保存 ACL **之后**生成，并勾选 `tag:derp`；<br>3. 若不想使用标签，可将 `derp.env` 中的 `TS_ADVERTISE_TAGS=` 留空。 |
+| **`tailscale netcheck` 看不到自定义区域** | 检查 Tailscale ACL 中的 `derpMap` 是否已保存、JSON 格式是否正确、`RegionID` 是否在 `900–999` 范围内。 |
+| **能看到自定义区域但无延迟（`*`）或连不上** | 1. 检查云安全组是否已放行 **UDP 3478**（注意是 UDP 而非 TCP）及 **ICMP**；<br>2. 确保 `derpMap` 的节点中包含脚本生成的 `"IPv4": "真实IP"` 和 `"IPv6": "none"`（防止本地代理软件的 Fake-IP 将域名解析为 `198.18.x.x`）。 |
+| **提示等待 dpkg / apt 软件包锁** | 新开 Ubuntu 实例首次启动时常在后台运行 `unattended-upgrades` 自动更新。脚本会自动等待最多 5 分钟，若超时再重跑一次即可，请勿强行删除锁文件。 |
+| **`--verify-clients` 拒绝客户端连接** | 检查 Tailscale ACL 规则是否过于严格，确保 DERP 节点（`tag:derp`）在网络中能「看到」需要连接它的客户端设备。 |
+
+---
+
+## 项目文件结构
+
+| 文件 | 运行位置 | 说明 |
+| :--- | :--- | :--- |
+| [`derp.env.example`](derp.env.example) | 本地或 VPS | 配置文件模板，复制为 `derp.env` 后填写 |
+| [`install.sh`](install.sh) | VPS（`sudo`） | 核心自动化安装、升级、状态检查与卸载脚本 |
+| [`upload.sh`](upload.sh) | 本地电脑 | 校验本地 `derp.env` 并通过 SSH/SCP 上传至 VPS（支持 `--run`） |
+| [`.gitignore`](.gitignore) | Git 仓库 | 默认忽略 `derp.env`，防止私钥与授权凭证被意外提交 |
+| [`LICENSE`](LICENSE) | Git 仓库 | MIT 开源许可协议 |
+
+---
+
+## 开源许可（License）
+
+本项目基于 [MIT License](LICENSE) 开源。
