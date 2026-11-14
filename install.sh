@@ -1,20 +1,27 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# derp-bootstrap：一键部署与维护私人 Tailscale DERP 中转节点
+# derp-bootstrap：一键部署与维护私人 Tailscale DERP 中转节点 / 普通客户端节点
 #
 # 用法：
-#   sudo bash install.sh              # 安装或按当前配置更新（默认）
-#   sudo bash install.sh --update     # 升级 Tailscale 并重新编译对应版本的 derper
-#   sudo bash install.sh --status     # 查看运行状态并打印 derpMap 配置
-#   sudo bash install.sh --uninstall  # 卸载 derper 服务与证书
-#   bash install.sh --help            # 查看帮助说明
+#   sudo bash install.sh                    # 安装或更新 DERP 中转节点（默认，读取 derp.env）
+#   sudo bash install.sh --update           # 升级 Tailscale 并重新编译对应版本的 derper
+#   sudo bash install.sh --status           # 查看 DERP 运行状态并打印 derpMap 配置
+#   sudo bash install.sh --uninstall        # 卸载 derper 服务与证书
+#   sudo bash install.sh --client           # 安装或更新普通设备/计算节点（读取 client.env）
+#   sudo bash install.sh --client --update  # 升级普通设备上的 Tailscale 并同步配置
+#   sudo bash install.sh --client --status  # 查看普通设备的 Tailscale 连接状态
+#   sudo bash install.sh --client --uninstall # 退出 Tailscale 网络并停用 tailscaled
+#   bash install.sh --help                  # 查看帮助说明
 # ==============================================================================
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="${HERE}/derp.env"
+CLIENT_ENV_FILE="${HERE}/client.env"
+ACTIVE_ENV_FILE=""
 UNIT_PATH="/etc/systemd/system/derper.service"
 ENV_SYSTEM="/etc/derp-bootstrap.env"
+CLIENT_ENV_SYSTEM="/etc/derp-bootstrap-client.env"
 CERT_DIR="/var/lib/derper/certs"
 DERPER_BIN="/usr/local/bin/derper"
 export PATH="/usr/local/go/bin:/usr/local/bin:${PATH}"
@@ -27,18 +34,24 @@ usage() {
   cat <<'EOF'
 用法：sudo bash install.sh [选项]
 
-选项：
-  (无参数)      读取同目录下的 derp.env，完成安装或配置更新（可重复执行）
-  --update      升级本机 Tailscale 并重新编译对齐版本的 derper
-  --status      检查 derper / tailscaled 状态，并重新打印 derpMap JSON
-  --uninstall   停止并卸载 derper 服务、systemd 单元及本地证书
+模式：
+  (默认)        DERP 中转节点模式，读取同目录下的 derp.env
+  --client      普通设备 / 计算节点模式，读取同目录下的 client.env（不装 Go/derper，直接入网并支持 SSH）
+
+操作选项（可与 --client 组合使用）：
+  (无参数)      安装或按当前配置更新（可重复执行）
+  --update      升级本机 Tailscale（DERP 模式下同时重新编译对齐版本的 derper）
+  --status      查看运行状态（DERP 模式下同时打印 derpMap JSON）
+  --uninstall   卸载服务（DERP 模式卸载 derper；--client 模式退出并停用 tailscaled）
   -h, --help    显示本帮助信息
 EOF
 }
 
+MODE="derp"
 ACTION="install"
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --client)    MODE="client" ;;
     --install)   ACTION="install" ;;
     --update)    ACTION="update" ;;
     --status)    ACTION="status" ;;
@@ -50,7 +63,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-  fail "请使用 root 权限运行：sudo bash install.sh ${ACTION:+--${ACTION}}"
+  client_flag=""
+  [[ "$MODE" == "client" ]] && client_flag="--client "
+  fail "请使用 root 权限运行：sudo bash install.sh ${client_flag}${ACTION:+--${ACTION}}"
 fi
 
 # ------------------------------------------------------------------------------
@@ -83,7 +98,7 @@ load_env_file() {
       val="${val%"${val##*[![:space:]]}"}"
     fi
     case "$key" in
-      DERP_HOSTNAME|TS_AUTHKEY|TS_HOSTNAME|TS_ADVERTISE_TAGS|DERP_REGION_ID|DERP_REGION_CODE|DERP_REGION_NAME|ACME_EMAIL|DERP_PORT|DERP_HTTP_PORT|DERP_STUN_PORT|DERP_VERIFY_CLIENTS|PUBLIC_IPV4)
+      DERP_HOSTNAME|TS_AUTHKEY|TS_HOSTNAME|TS_ADVERTISE_TAGS|TS_SSH|TS_ACCEPT_DNS|TS_ACCEPT_ROUTES|DERP_REGION_ID|DERP_REGION_CODE|DERP_REGION_NAME|ACME_EMAIL|DERP_PORT|DERP_HTTP_PORT|DERP_STUN_PORT|DERP_VERIFY_CLIENTS|PUBLIC_IPV4)
         printf -v "$key" '%s' "$val"
         ;;
       *)
@@ -91,6 +106,26 @@ load_env_file() {
         ;;
     esac
   done < "$file"
+}
+
+is_valid_dns_label() {
+  local name="$1"
+  [[ ${#name} -ge 1 && ${#name} -le 63 && "$name" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]]
+}
+
+sanitize_dns_label() {
+  local raw="$1"
+  local clean
+  clean="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//')"
+  clean="${clean:0:63}"
+  clean="${clean%-}"
+  printf '%s' "$clean"
+}
+
+validate_ts_hostname() {
+  if ! is_valid_dns_label "$TS_HOSTNAME"; then
+    fail "TS_HOSTNAME（${TS_HOSTNAME}）不符合 Tailscale DNS 标签规范：只能包含字母、数字和连字符（-），不能包含下划线（_）或以 - 开头/结尾，且长度不超过 63 个字符（例如：compute-test）。"
+  fi
 }
 
 init_config() {
@@ -102,11 +137,15 @@ init_config() {
   else
     fail "找不到 ${ENV_FILE}。请先执行 cp derp.env.example derp.env 并填写配置。"
   fi
+  ACTIVE_ENV_FILE="$ENV_FILE"
 
   DERP_HOSTNAME="${DERP_HOSTNAME:-}"
   TS_AUTHKEY="${TS_AUTHKEY:-}"
   TS_HOSTNAME="${TS_HOSTNAME:-}"
   TS_ADVERTISE_TAGS="${TS_ADVERTISE_TAGS-tag:derp}"
+  TS_SSH="false"
+  TS_ACCEPT_DNS="false"
+  TS_ACCEPT_ROUTES="false"
   DERP_REGION_ID="${DERP_REGION_ID:-900}"
   DERP_REGION_CODE="${DERP_REGION_CODE:-myderp}"
   DERP_REGION_NAME="${DERP_REGION_NAME:-My DERP}"
@@ -127,8 +166,43 @@ init_config() {
   [[ "$DERP_VERIFY_CLIENTS" == "true" || "$DERP_VERIFY_CLIENTS" == "false" ]] || fail "DERP_VERIFY_CLIENTS 只能是 true 或 false"
 
   if [[ -z "$TS_HOSTNAME" ]]; then
-    TS_HOSTNAME="${DERP_HOSTNAME%%.*}"
+    TS_HOSTNAME="$(sanitize_dns_label "${DERP_HOSTNAME%%.*}")"
   fi
+  validate_ts_hostname
+}
+
+init_client_config() {
+  if [[ -f "$CLIENT_ENV_FILE" ]]; then
+    load_env_file "$CLIENT_ENV_FILE"
+  elif [[ "$ACTION" != "install" && -f "$CLIENT_ENV_SYSTEM" ]]; then
+    log "未找到 ${CLIENT_ENV_FILE}，使用已安装的 ${CLIENT_ENV_SYSTEM} 配置。"
+    load_env_file "$CLIENT_ENV_SYSTEM"
+  else
+    fail "找不到 ${CLIENT_ENV_FILE}。请先执行 cp client.env.example client.env && chmod 600 client.env 并填写配置。"
+  fi
+  ACTIVE_ENV_FILE="$CLIENT_ENV_FILE"
+
+  TS_AUTHKEY="${TS_AUTHKEY:-}"
+  TS_HOSTNAME="${TS_HOSTNAME:-}"
+  TS_ADVERTISE_TAGS="${TS_ADVERTISE_TAGS:-}"
+  TS_SSH="${TS_SSH:-true}"
+  TS_ACCEPT_DNS="${TS_ACCEPT_DNS:-true}"
+  TS_ACCEPT_ROUTES="${TS_ACCEPT_ROUTES:-false}"
+
+  [[ "$TS_SSH" == "true" || "$TS_SSH" == "false" ]] || fail "TS_SSH 只能是 true 或 false"
+  [[ "$TS_ACCEPT_DNS" == "true" || "$TS_ACCEPT_DNS" == "false" ]] || fail "TS_ACCEPT_DNS 只能是 true 或 false"
+  [[ "$TS_ACCEPT_ROUTES" == "true" || "$TS_ACCEPT_ROUTES" == "false" ]] || fail "TS_ACCEPT_ROUTES 只能是 true 或 false"
+
+  if [[ -z "$TS_HOSTNAME" ]]; then
+    local raw_host
+    raw_host="$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)"
+    TS_HOSTNAME="$(sanitize_dns_label "$raw_host")"
+    [[ -n "$TS_HOSTNAME" ]] || fail "无法自动获取有效的本机主机名，请在 client.env 中指定 TS_HOSTNAME（仅限字母、数字和连字符 -）。"
+    if [[ "$TS_HOSTNAME" != "$raw_host" ]]; then
+      log "本机主机名「${raw_host}」包含非 DNS 标签字符，已自动规范化为「${TS_HOSTNAME}」。"
+    fi
+  fi
+  validate_ts_hostname
 }
 
 # ------------------------------------------------------------------------------
@@ -160,15 +234,23 @@ wait_apt_lock() {
 
 install_pkgs() {
   log "安装系统基础依赖……"
+  local extra_apt="" extra_rpm=""
+  if [[ "$MODE" != "client" ]]; then
+    extra_apt="dnsutils iproute2"
+    extra_rpm="bind-utils iproute"
+  fi
   if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
     wait_apt_lock
     apt-get update -y
-    apt-get install -y curl ca-certificates dnsutils iproute2
+    # shellcheck disable=SC2086
+    apt-get install -y curl ca-certificates ${extra_apt}
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y curl ca-certificates bind-utils iproute
+    # shellcheck disable=SC2086
+    dnf install -y curl ca-certificates ${extra_rpm}
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y curl ca-certificates bind-utils iproute
+    # shellcheck disable=SC2086
+    yum install -y curl ca-certificates ${extra_rpm}
   else
     fail "未识别的包管理器，请使用 Ubuntu、Debian、Alibaba Cloud Linux 或 CentOS/Rocky/AlmaLinux。"
   fi
@@ -287,15 +369,20 @@ join_tailnet() {
 
   local up_flags=(
     --hostname="$TS_HOSTNAME"
-    --accept-dns=false
-    --ssh=false
+    --accept-dns="$TS_ACCEPT_DNS"
+    --ssh="$TS_SSH"
   )
+  if [[ "$MODE" == "client" ]]; then
+    up_flags+=(--accept-routes="$TS_ACCEPT_ROUTES")
+  fi
   if [[ -n "$TS_ADVERTISE_TAGS" ]]; then
     up_flags+=(--advertise-tags="$TS_ADVERTISE_TAGS")
   fi
 
   if [[ "$need_auth" -eq 1 ]]; then
-    [[ -n "$TS_AUTHKEY" ]] || fail "本机尚未登录 Tailscale，请在 derp.env 中填写有效的 TS_AUTHKEY（或先手动执行 tailscale up 完成登录）。"
+    local env_basename="derp.env"
+    [[ "$MODE" == "client" ]] && env_basename="client.env"
+    [[ -n "$TS_AUTHKEY" ]] || fail "本机尚未登录 Tailscale，请在 ${env_basename} 中填写有效的 TS_AUTHKEY（或先手动执行 tailscale up 完成登录）。"
     [[ "$TS_AUTHKEY" == tskey-auth-* ]] || fail "TS_AUTHKEY 格式不正确，应以 tskey-auth- 开头。"
     [[ "$TS_AUTHKEY" != "tskey-auth-xxxxxxxx" ]] || fail "TS_AUTHKEY 仍是示例值，请填入真实的 Tailscale 授权密钥。"
 
@@ -304,7 +391,7 @@ join_tailnet() {
       fail "加入 Tailscale 失败。请检查：1) TS_AUTHKEY 是否未过期；2) 若启用了标签（${TS_ADVERTISE_TAGS:-无}），请确保已在 Tailscale ACL 的 tagOwners 中声明该标签，且密钥是在保存 ACL 之后生成的。"
     fi
 
-    if [[ -f "$ENV_FILE" ]]; then
+    if [[ -n "$ACTIVE_ENV_FILE" && -f "$ACTIVE_ENV_FILE" ]]; then
       umask 077
       local tmp
       tmp="$(mktemp)"
@@ -314,14 +401,21 @@ join_tailnet() {
         else
           printf '%s\n' "$line"
         fi
-      done < "$ENV_FILE" > "$tmp"
-      mv "$tmp" "$ENV_FILE"
-      chmod 600 "$ENV_FILE"
-      log "已从服务器上的 derp.env 中擦除 TS_AUTHKEY。"
+      done < "$ACTIVE_ENV_FILE" > "$tmp"
+      mv "$tmp" "$ACTIVE_ENV_FILE"
+      chmod 600 "$ACTIVE_ENV_FILE"
+      log "已从服务器上的 ${env_basename} 中擦除 TS_AUTHKEY。"
     fi
   else
-    log "同步 Tailscale 节点名称与标签设置……"
-    local set_flags=(--hostname="$TS_HOSTNAME" --accept-dns=false)
+    log "同步 Tailscale 节点名称、SSH 与标签设置……"
+    local set_flags=(
+      --hostname="$TS_HOSTNAME"
+      --accept-dns="$TS_ACCEPT_DNS"
+      --ssh="$TS_SSH"
+    )
+    if [[ "$MODE" == "client" ]]; then
+      set_flags+=(--accept-routes="$TS_ACCEPT_ROUTES")
+    fi
     if [[ -n "$TS_ADVERTISE_TAGS" ]]; then
       set_flags+=(--advertise-tags="$TS_ADVERTISE_TAGS")
     fi
@@ -572,6 +666,96 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
+# 客户端模式（--client）辅助与子命令
+# ------------------------------------------------------------------------------
+save_client_env() {
+  umask 077
+  cat > "$CLIENT_ENV_SYSTEM" <<EOF
+TS_HOSTNAME=${TS_HOSTNAME}
+TS_ADVERTISE_TAGS=${TS_ADVERTISE_TAGS}
+TS_SSH=${TS_SSH}
+TS_ACCEPT_DNS=${TS_ACCEPT_DNS}
+TS_ACCEPT_ROUTES=${TS_ACCEPT_ROUTES}
+EOF
+  chmod 600 "$CLIENT_ENV_SYSTEM"
+}
+
+print_client_summary() {
+  local ts_ip4 ts_ip6
+  ts_ip4="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
+  ts_ip6="$(tailscale ip -6 2>/dev/null | head -n1 || true)"
+  cat <<EOF
+
+======================== 设备入网完成 ========================
+
+节点名称（Tailscale）：${TS_HOSTNAME}
+Tailscale IPv4：${ts_ip4:-未分配}
+Tailscale IPv6：${ts_ip6:-未分配}
+Tailscale SSH ：${TS_SSH}
+接受 MagicDNS ：${TS_ACCEPT_DNS}
+宣告标签      ：${TS_ADVERTISE_TAGS:-无}
+
+连接提示：
+  可在同一 Tailnet 内的其他设备上通过以下命令 SSH 登录本机：
+    ssh <用户名>@${TS_HOSTNAME}
+  或使用 Tailscale IP：
+    ssh <用户名>@${ts_ip4:-<Tailscale-IP>}
+
+日常维护命令：
+  sudo bash install.sh --client --status     # 查看 Tailscale 连接状态
+  sudo bash install.sh --client --update     # 升级 Tailscale 并同步配置
+  sudo bash install.sh --client --uninstall  # 退出 Tailscale 网络并停用服务
+==============================================================
+EOF
+}
+
+do_client_install() {
+  init_client_config
+  install_pkgs
+  install_or_update_tailscale 0
+  join_tailnet
+  save_client_env
+  print_client_summary
+}
+
+do_client_update() {
+  init_client_config
+  install_pkgs
+  install_or_update_tailscale 1
+  join_tailnet
+  save_client_env
+  print_client_summary
+}
+
+do_client_status() {
+  echo "------ 客户端运行状态 ------"
+  echo "Tailscale 状态："
+  if is_tailscale_running; then
+    echo "  [运行中] $(tailscale version | head -n1)"
+    echo "  Tailscale IPv4: $(tailscale ip -4 2>/dev/null | head -n1 || echo '无')"
+    echo "  Tailscale IPv6: $(tailscale ip -6 2>/dev/null | head -n1 || echo '无')"
+    echo
+    tailscale status || true
+  else
+    echo "  [未运行或未登录]"
+  fi
+}
+
+do_client_uninstall() {
+  log "正在退出 Tailscale 网络并停用 tailscaled 服务……"
+  if command -v tailscale >/dev/null 2>&1; then
+    tailscale logout 2>/dev/null || true
+  fi
+  if systemctl list-unit-files 2>/dev/null | grep -q '^tailscaled\.service'; then
+    systemctl stop tailscaled.service 2>/dev/null || true
+    systemctl disable tailscaled.service 2>/dev/null || true
+  fi
+  rm -f "$CLIENT_ENV_SYSTEM"
+  log "已退出 Tailscale 网络并停用 tailscaled 服务。"
+  log "注：Tailscale 软件包本身已保留；如需彻底卸载可执行：apt-get remove -y tailscale（或 dnf/yum remove -y tailscale）。"
+}
+
+# ------------------------------------------------------------------------------
 # 子命令执行流程
 # ------------------------------------------------------------------------------
 do_uninstall() {
@@ -638,9 +822,13 @@ do_install() {
   print_derpmap "$pub4" "$pub6"
 }
 
-case "$ACTION" in
-  install)   do_install ;;
-  update)    do_update ;;
-  status)    do_status ;;
-  uninstall) do_uninstall ;;
+case "${MODE}:${ACTION}" in
+  derp:install)     do_install ;;
+  derp:update)      do_update ;;
+  derp:status)      do_status ;;
+  derp:uninstall)   do_uninstall ;;
+  client:install)   do_client_install ;;
+  client:update)    do_client_update ;;
+  client:status)    do_client_status ;;
+  client:uninstall) do_client_uninstall ;;
 esac

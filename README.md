@@ -268,6 +268,28 @@ tailscale netcheck
 
 ---
 
+## 普通设备 / 客户端部署（`--client` 模式）
+
+如果只需要让一台普通设备（如算力节点、内网服务器、开发机等）快速加入 Tailscale 网络并支持 Tailscale SSH，无需安装 Go 和 `derper`，可使用 `--client` 模式与 [`client.env.example`](client.env.example)：
+
+1. **准备配置**：
+   ```bash
+   cp client.env.example client.env && chmod 600 client.env
+   # 编辑 client.env，至少填入 TS_AUTHKEY（TS_HOSTNAME 留空则默认使用本机主机名）
+   ```
+2. **本地一键上传并部署**（或直接在该设备上运行 `sudo bash install.sh --client`）：
+   ```bash
+   ./upload.sh --client --run root@<设备IP>
+   ```
+3. **日常维护**：
+   ```bash
+   sudo bash install.sh --client --status     # 查看 Tailscale 连接状态与 IP
+   sudo bash install.sh --client --update     # 升级 Tailscale 并同步配置
+   sudo bash install.sh --client --uninstall  # 退出 Tailscale 网络并停用 tailscaled
+   ```
+
+---
+
 ## 常见问题排查（FAQ）
 
 | 现象 / 报错 | 排查方法与解决方案 |
@@ -287,10 +309,11 @@ tailscale netcheck
 
 | 文件 | 运行位置 | 说明 |
 | :--- | :--- | :--- |
-| [`derp.env.example`](derp.env.example) | 本地或 VPS | 配置文件模板，复制为 `derp.env` 后填写 |
-| [`install.sh`](install.sh) | VPS（`sudo`） | 核心自动化安装、升级、状态检查与卸载脚本 |
-| [`upload.sh`](upload.sh) | 本地电脑 | 校验本地 `derp.env` 并通过 SSH/SCP 上传至 VPS（支持 `--run`） |
-| [`.gitignore`](.gitignore) | Git 仓库 | 默认忽略 `derp.env`，防止私钥与授权凭证被意外提交 |
+| [`derp.env.example`](derp.env.example) | 本地或 VPS | DERP 中转节点配置文件模板，复制为 `derp.env` 后填写 |
+| [`client.env.example`](client.env.example) | 本地或目标设备 | 普通设备（`--client` 模式）配置文件模板，复制为 `client.env` 后填写 |
+| [`install.sh`](install.sh) | 目标机器（`sudo`） | 核心自动化安装、升级、状态检查与卸载脚本（支持 `--client`） |
+| [`upload.sh`](upload.sh) | 本地电脑 | 校验本地配置并通过 SSH/SCP 上传至目标机器（支持 `--client`、`--run`） |
+| [`.gitignore`](.gitignore) | Git 仓库 | 默认忽略 `derp.env` 与 `client.env`，防止私钥与授权凭证被意外提交 |
 | [`LICENSE`](LICENSE) | Git 仓库 | MIT 开源许可协议 |
 
 ---

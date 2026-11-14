@@ -1,4 +1,5 @@
 derp.env
+client.env
 *.bak
 *~
 .DS_Store
