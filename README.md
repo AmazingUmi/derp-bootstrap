@@ -1,6 +1,15 @@
 # derp-bootstrap
 
-一键在 Linux VPS 上部署与维护私人 [Tailscale DERP](https://tailscale.com/docs/reference/derp-servers/custom-derp-servers) 中转节点的自动化脚本。
+一键在 Linux 服务器上部署与维护私人 [Tailscale DERP](https://tailscale.com/docs/reference/derp-servers/custom-derp-servers) 中转节点，或将普通设备 / 计算节点快速接入 Tailscale 网络并开启 SSH 的自动化脚本。
+
+脚本支持两种部署模式（通过命令行参数切换）：
+
+| 模式 | 命令 | 配置文件 | 适用场景 |
+| :--- | :--- | :--- | :--- |
+| **DERP 中转模式（默认）** | `sudo bash install.sh` | `derp.env` | 部署私人 DERP + STUN 中转节点（需要域名、公网 IP、Go 与 `derper`） |
+| **普通节点模式（`--client`）** | `sudo bash install.sh --client` | `client.env` | 仅将机器（如算力节点、内网服务器、开发机）加入 Tailscale 并开启 SSH（**不装 Go / `derper`，无需域名与公网端口**） |
+
+> 如果你**只想把一台普通机器或计算节点接入 Tailscale 并用 SSH 连上去**，可以直接跳到 [普通设备 / 客户端部署（`--client` 模式，不做 DERP）](#普通设备--客户端部署--client-模式不做-derp)。
 
 当两台 Tailscale 设备因复杂 NAT 无法打洞直连（P2P）时，流量会通过 DERP 服务器进行端到端加密中转。官方公共中转节点在跨网或高峰期往往延迟较高，自建私人 DERP 可以显著降低中转延迟并提升连接稳定性。
 
@@ -33,6 +42,7 @@
   - [2. 验证节点连通性](#2-验证节点连通性)
 - [配置项参考（derp.env）](#配置项参考derpenv)
 - [日常维护（升级、状态、扩容、卸载）](#日常维护升级状态扩容卸载)
+- [普通设备 / 客户端部署（--client 模式，不做 DERP）](#普通设备--客户端部署--client-模式不做-derp)
 - [常见问题排查（FAQ）](#常见问题排查faq)
 
 ---
@@ -268,25 +278,62 @@ tailscale netcheck
 
 ---
 
-## 普通设备 / 客户端部署（`--client` 模式）
+## 普通设备 / 客户端部署（`--client` 模式，不做 DERP）
 
-如果只需要让一台普通设备（如算力节点、内网服务器、开发机等）快速加入 Tailscale 网络并支持 Tailscale SSH，无需安装 Go 和 `derper`，可使用 `--client` 模式与 [`client.env.example`](client.env.example)：
+如果只需要让一台普通设备（如算力节点、GPU 机器、内网服务器、开发机等）快速加入 Tailscale 网络并支持 SSH 登录，**不作为 DERP 中转节点**，请使用 `--client` 模式与 [`client.env.example`](client.env.example)。
 
-1. **准备配置**：
+该模式会**跳过**域名检查、公网端口检查、Go 环境安装、`derper` 编译和证书签发，仅完成：安装基础依赖（`curl`、`ca-certificates`）→ 安装并启动 `tailscaled` → 使用 `TS_AUTHKEY` 加入 Tailscale 网络 → 开启 Tailscale SSH 与 MagicDNS → 擦除配置中的 `TS_AUTHKEY`。
+
+### 1. 环境要求（`--client` 模式）
+
+- 支持主流 Linux 发行版（Ubuntu / Debian / Alibaba Cloud Linux / CentOS / Rocky / AlmaLinux）。
+- **无需**域名、**无需**固定公网 IP、**无需**放行 `80/443/3478` 端口，设备能正常访问外网即可。
+
+### 2. 准备配置并部署
+
+1. **生成并编辑配置文件**：
    ```bash
    cp client.env.example client.env && chmod 600 client.env
-   # 编辑 client.env，至少填入 TS_AUTHKEY（TS_HOSTNAME 留空则默认使用本机主机名）
+   # 编辑 client.env，至少填入 TS_AUTHKEY
    ```
-2. **本地一键上传并部署**（或直接在该设备上运行 `sudo bash install.sh --client`）：
+   > **关于 `TS_HOSTNAME`**：留空时会自动读取本机主机名；若主机名包含下划线 `_`（如 `compute_test`），脚本会自动将其规范化为连字符 `-`（`compute-test`）。如果手动填写，请确保只使用字母、数字和 `-`。
+
+2. **执行部署**（二选一）：
+   - **本地一键上传并部署**：
+     ```bash
+     ./upload.sh --client --run root@<设备IP>
+     ```
+   - **直接在目标设备上执行**：
+     ```bash
+     sudo bash install.sh --client
+     ```
+
+3. **SSH 连接该节点**：
+   入网成功后，终端会输出分配的 Tailscale IP 与节点名。在同一 Tailnet 内的其他设备上可直接通过 Tailscale SSH 登录：
    ```bash
-   ./upload.sh --client --run root@<设备IP>
+   ssh <用户名>@<节点名>
+   # 或使用 Tailscale IP
+   ssh <用户名>@<Tailscale-IP>
    ```
-3. **日常维护**：
-   ```bash
-   sudo bash install.sh --client --status     # 查看 Tailscale 连接状态与 IP
-   sudo bash install.sh --client --update     # 升级 Tailscale 并同步配置
-   sudo bash install.sh --client --uninstall  # 退出 Tailscale 网络并停用 tailscaled
-   ```
+
+### 3. `client.env` 配置项参考
+
+| 变量 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `TS_AUTHKEY` | *必填* | Tailscale 授权密钥（`tskey-auth-` 开头）；首次入网成功后自动擦除 |
+| `TS_HOSTNAME` | 空 | 在 Tailscale 中显示的机器名；留空则自动使用本机主机名（自动规范化非法字符） |
+| `TS_ADVERTISE_TAGS` | 空 | 节点宣告的 ACL 标签（如 `tag:compute`），需提前在 Tailscale ACL 的 `tagOwners` 中声明 |
+| `TS_SSH` | `true` | 是否开启 Tailscale SSH（允许通过 Tailscale 直接 SSH 登录本机） |
+| `TS_ACCEPT_DNS` | `true` | 是否接受 Tailscale MagicDNS（可用设备名直接互访） |
+| `TS_ACCEPT_ROUTES` | `false` | 是否接受其他节点宣告的子网路由 |
+
+### 4. `--client` 模式日常维护
+
+```bash
+sudo bash install.sh --client --status     # 查看 Tailscale 连接状态与 IP
+sudo bash install.sh --client --update     # 升级 Tailscale 并同步 client.env 配置
+sudo bash install.sh --client --uninstall  # 退出 Tailscale 网络并停用 tailscaled
+```
 
 ---
 
